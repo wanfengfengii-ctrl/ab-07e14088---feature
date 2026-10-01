@@ -10,6 +10,10 @@ MIN_TARGETS = 12
 MAX_TARGETS = 48
 MIN_ANCHORS = 2
 MAX_ANCHORS = 8
+# Optional hold length: every constant-slope ramp (first and last included)
+# must cover at least this many adjacent element steps.
+MIN_RAMP_STEPS_MIN = 2
+MIN_RAMP_STEPS_MAX = 8
 # Input envelope: every delay/target/step magnitude must stay within
 # +/-VALUE_LIMIT so the integer DP costs cannot overflow int32.
 VALUE_LIMIT = 100_000
@@ -36,6 +40,10 @@ class CompileRequest(BaseModel):
                          description="max allowed absolute change between adjacent elements")
     maxRamps: int = Field(ge=1, le=MAX_RAMPS_LIMIT,
                           description="max number of ramps (runs of equal adjacent differences)")
+    minRampSteps: int | None = Field(
+        default=None, ge=MIN_RAMP_STEPS_MIN, le=MIN_RAMP_STEPS_MAX,
+        description="optional minimum adjacent steps every ramp must span "
+                    "(first and last included); omitted keeps legacy behaviour")
     anchors: list[AnchorIn] = Field(
         min_length=MIN_ANCHORS, max_length=MAX_ANCHORS,
         description="elements whose delays must be hit exactly")
@@ -68,4 +76,5 @@ class CompileRequest(BaseModel):
             max_ramps=self.maxRamps,
             anchors=tuple(Anchor(element=a.element, delay=a.delay)
                           for a in self.anchors),
+            min_ramp_steps=self.minRampSteps,
         )

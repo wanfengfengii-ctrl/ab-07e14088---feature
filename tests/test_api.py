@@ -120,6 +120,111 @@ def test_compile_ramp_limit_infeasible():
     assert body["delays"] is None
 
 
+# ---------------------------------------------------------------------------
+# minRampSteps (minimum ramp hold length)
+# ---------------------------------------------------------------------------
+
+def test_legacy_request_shape_is_unchanged():
+    # no minRampSteps: request and response keep the exact legacy contract
+    req = typical_request()
+    assert "minRampSteps" not in req
+    body = client.post("/api/delay-plans/compile", json=req).json()
+    assert body["feasible"] is True
+    for ramp in body["ramps"]:
+        assert "stepCount" not in ramp
+        assert set(ramp) == {
+            "startElement", "endElement", "slope",
+            "startValue", "endValue"}
+
+
+def test_min_ramp_steps_feasible_reports_step_count():
+    req = dict(typical_request(), minRampSteps=3)
+    resp = client.post("/api/delay-plans/compile", json=req)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["feasible"] is True
+    delays = body["delays"]
+    n = len(delays)
+    for ramp in body["ramps"]:
+        # stepCount present on every ramp and consistent with boundaries
+        assert ramp["stepCount"] == ramp["endElement"] - ramp["startElement"]
+        assert ramp["stepCount"] >= 3
+        assert ramp["startValue"] == delays[ramp["startElement"]]
+        assert ramp["endValue"] == delays[ramp["endElement"]]
+        assert (delays[ramp["endElement"]] - delays[ramp["startElement"]]
+                == ramp["slope"] * ramp["stepCount"])
+    assert body["ramps"][0]["startElement"] == 0
+    assert body["ramps"][-1]["endElement"] == n - 1
+
+
+def test_min_ramp_steps_span_conflict_is_stable_and_partial_free():
+    # forced 2 -> 0 drop spans only two steps at the end, so a hold of 3
+    # cannot be met jointly with the anchors
+    req = {
+        "targets": [2] * 12,
+        "minDelay": 0,
+        "maxDelay": 40,
+        "maxStep": 1,
+        "maxRamps": 6,
+        "minRampSteps": 3,
+        "anchors": [
+            {"element": 0, "delay": 2},
+            {"element": 8, "delay": 2},
+            {"element": 11, "delay": 0},
+        ],
+    }
+    resp = client.post("/api/delay-plans/compile", json=req)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "feasible": False,
+        "reason": "ramp-span-conflict",
+        "minRampSteps": 3,
+        "delays": None,
+        "errors": None,
+        "ramps": None,
+        "maxAbsError": None,
+        "totalAbsError": None,
+        "rampCount": None,
+    }
+    again = client.post("/api/delay-plans/compile", json=req).json()
+    assert again == body
+
+
+def test_min_ramp_steps_conflict_even_under_ramp_cap_shortage():
+    # three ramps of two steps each would satisfy the hold, but the cap is
+    # two; with the hold enabled the joint system still reports span
+    # conflict rather than ramp-limit-exceeded
+    req = {
+        "targets": [0, 1, 2, 1, 0, 1, 2, 3, 4, 5, 6, 7],
+        "minDelay": 0,
+        "maxDelay": 10,
+        "maxStep": 2,
+        "maxRamps": 2,
+        "minRampSteps": 2,
+        "anchors": [
+            {"element": 0, "delay": 0},
+            {"element": 2, "delay": 2},
+            {"element": 4, "delay": 0},
+            {"element": 6, "delay": 2},
+            {"element": 11, "delay": 7},
+        ],
+    }
+    body = client.post("/api/delay-plans/compile", json=req).json()
+    assert body["feasible"] is False
+    assert body["reason"] == "ramp-span-conflict"
+    assert body["delays"] is None
+
+
+def test_min_ramp_steps_validation_bounds():
+    for bad in (1, 9, 0, -2):
+        req = dict(typical_request(), minRampSteps=bad)
+        assert client.post("/api/delay-plans/compile", json=req).status_code == 422
+    for good in (2, 8):
+        req = dict(typical_request(), minRampSteps=good)
+        assert client.post("/api/delay-plans/compile", json=req).status_code == 200
+
+
 def _invalid_requests():
     base = typical_request()
     too_few_targets = dict(base, targets=[1] * 11)

@@ -17,7 +17,8 @@ from app.solver import (
 sys.setrecursionlimit(100_000)
 
 
-def make_instance(targets, min_delay, max_delay, max_step, max_ramps, anchors):
+def make_instance(targets, min_delay, max_delay, max_step, max_ramps, anchors,
+                  min_ramp_steps=None):
     return Instance(
         targets=tuple(targets),
         min_delay=min_delay,
@@ -25,6 +26,7 @@ def make_instance(targets, min_delay, max_delay, max_step, max_ramps, anchors):
         max_step=max_step,
         max_ramps=max_ramps,
         anchors=tuple(Anchor(element=e, delay=d) for e, d in anchors),
+        min_ramp_steps=min_ramp_steps,
     )
 
 
@@ -32,9 +34,10 @@ def brute_force_best(inst: Instance):
     """Exhaustive reference: best (maxErr, totalErr, ramps, sequence)."""
     n = inst.n
     anchor_map = {a.element: a.delay for a in inst.anchors}
+    hold = inst.min_ramp_steps or 1
     best = None
 
-    def rec(i, prev_v, prev_k, ramps, seq, max_e, tot_e):
+    def rec(i, prev_v, prev_k, ramps, run_len, seq, max_e, tot_e):
         nonlocal best
         if best is not None:
             if max_e > best[0]:
@@ -47,6 +50,9 @@ def brute_force_best(inst: Instance):
                 if ramps == best[2] and tuple(seq) > best[3][: len(seq)]:
                     return
         if i == n:
+            # the final ramp must also satisfy the minimum span
+            if run_len < hold:
+                return
             key = (max_e, tot_e, ramps, tuple(seq))
             if best is None or key < best:
                 best = key
@@ -63,23 +69,27 @@ def brute_force_best(inst: Instance):
             )
         for v in candidates:
             if i == 0:
-                k, r = None, 0
+                k, r, length = None, 0, 0
             else:
                 k = v - prev_v
                 if abs(k) > inst.max_step:
                     continue
                 if i == 1:
-                    r = 1
+                    r, length = 1, 1
                 elif k == prev_k:
-                    r = ramps
+                    r, length = ramps, run_len + 1
                 else:
-                    r = ramps + 1
+                    # a slope change may only leave a ramp that has
+                    # already covered `hold` adjacent steps
+                    if run_len < hold:
+                        continue
+                    r, length = ramps + 1, 1
                 if r > inst.max_ramps:
                     continue
             e = abs(v - inst.targets[i])
-            rec(i + 1, v, k, r, seq + [v], max(max_e, e), tot_e + e)
+            rec(i + 1, v, k, r, length, seq + [v], max(max_e, e), tot_e + e)
 
-    rec(0, None, None, 0, [], 0, 0)
+    rec(0, None, None, 0, 0, [], 0, 0)
     return best
 
 
@@ -127,6 +137,11 @@ def check_feasible_shape(inst: Instance, result: dict):
         assert delays[e] - delays[s] == k * (e - s)
         for i in range(s, e):
             assert delays[i + 1] - delays[i] == k
+        if inst.min_ramp_steps:
+            assert ramp["stepCount"] == e - s
+            assert e - s >= inst.min_ramp_steps
+        else:
+            assert "stepCount" not in ramp
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +328,130 @@ def test_result_is_deterministic():
 
 
 # ---------------------------------------------------------------------------
+# minimum ramp span (minRampSteps)
+# ---------------------------------------------------------------------------
+
+def test_hold_allows_long_ramps_and_reports_step_count():
+    # perfect triangle, each leg spans 11 adjacent steps
+    targets = list(range(12)) + list(range(10, -1, -1))  # 23 elements
+    inst = make_instance(
+        targets=targets, min_delay=0, max_delay=20, max_step=2,
+        max_ramps=4, anchors=[(0, 0), (11, 11), (22, 0)],
+        min_ramp_steps=3)
+    res = compile_plan(inst)
+    assert res["feasible"] is True
+    assert res["rampCount"] == 2
+    assert [(r["startElement"], r["endElement"], r["slope"], r["stepCount"])
+            for r in res["ramps"]] == [
+        (0, 11, 1, 11), (11, 22, -1, 11)]
+    check_feasible_shape(inst, res)
+
+
+def test_hold_short_first_ramp_conflict():
+    # element 1 must already be 2 away from element 0 (maxStep 2), so the
+    # first ramp can only be one step long; hold of 3 cannot be satisfied
+    inst = make_instance(
+        targets=[0] * 12, min_delay=0, max_delay=20, max_step=2,
+        max_ramps=6, anchors=[(0, 0), (1, 2), (3, 2)],
+        min_ramp_steps=3)
+    res = compile_plan(inst)
+    assert res["feasible"] is False
+    assert res["reason"] == "ramp-span-conflict"
+    assert res["minRampSteps"] == 3
+    assert res["delays"] is None
+    assert res["errors"] is None
+    assert res["ramps"] is None
+    assert res["maxAbsError"] is None
+    assert res["totalAbsError"] is None
+    assert res["rampCount"] is None
+    # stable across repeated compilations
+    assert compile_plan(inst) == res
+
+
+def test_hold_short_last_ramp_conflict():
+    # the forced 2 -> 0 drop over the final 3 elements leaves only a
+    # 2-step last ramp; hold of 3 conflicts jointly with the anchors
+    inst = make_instance(
+        targets=[2] * 12, min_delay=0, max_delay=40, max_step=1,
+        max_ramps=6, anchors=[(0, 2), (8, 2), (11, 0)],
+        min_ramp_steps=3)
+    res = compile_plan(inst)
+    assert res["feasible"] is False
+    assert res["reason"] == "ramp-span-conflict"
+    assert res["minRampSteps"] == 3
+    assert res["delays"] is None
+
+
+def test_hold_short_inner_ramp_feasible_only_at_smaller_hold():
+    # anchors force a two-step peak (up-up-down): ramps of length 2
+    inst = make_instance(
+        targets=[0, 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+        min_delay=0, max_delay=10, max_step=2, max_ramps=6,
+        anchors=[(0, 0), (2, 2), (4, 0)],
+        min_ramp_steps=2)
+    res = compile_plan(inst)
+    assert res["feasible"] is True
+    assert all(r["stepCount"] >= 2 for r in res["ramps"])
+    assert [(r["startElement"], r["endElement"], r["stepCount"])
+            for r in res["ramps"]] == [(0, 2, 2), (2, 4, 2), (4, 11, 7)]
+    check_feasible_shape(inst, res)
+
+    same = make_instance(
+        targets=[0, 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+        min_delay=0, max_delay=10, max_step=2, max_ramps=6,
+        anchors=[(0, 0), (2, 2), (4, 0)],
+        min_ramp_steps=3)
+    res3 = compile_plan(same)
+    assert res3["feasible"] is False
+    assert res3["reason"] == "ramp-span-conflict"
+    assert res3["delays"] is None
+
+
+def test_hold_conflict_even_when_only_ramp_count_blocks():
+    # the hold is satisfiable if the ramp cap were relaxed (three ramps
+    # of two steps each), yet with the hold enabled an unsatisfiable
+    # joint system still reports ramp-span-conflict deterministically
+    inst = make_instance(
+        targets=[0, 1, 2, 1, 0, 1, 2, 3, 4, 5, 6, 7],
+        min_delay=0, max_delay=10, max_step=2, max_ramps=2,
+        anchors=[(0, 0), (2, 2), (4, 0), (6, 2), (11, 7)],
+        min_ramp_steps=2)
+    res = compile_plan(inst)
+    assert res["feasible"] is False
+    assert res["reason"] == "ramp-span-conflict"
+    assert res["minRampSteps"] == 2
+    assert res["delays"] is None
+    assert res["ramps"] is None
+
+
+def test_hold_constant_plan_satisfies_maximum_hold():
+    inst = make_instance(
+        targets=[5] * 12, min_delay=0, max_delay=10, max_step=1,
+        max_ramps=1, anchors=[(0, 5), (11, 5)],
+        min_ramp_steps=8)
+    res = compile_plan(inst)
+    assert res["feasible"] is True
+    assert res["rampCount"] == 1
+    assert res["ramps"][0]["stepCount"] == 11
+    check_feasible_shape(inst, res)
+
+
+def test_hold_changes_optimum_and_is_optimised_jointly():
+    # feasible with zero error in short ramps; the hold forces a different
+    # (still lexicographically optimal) sequence -- the solver must find it
+    # directly rather than merging/deleting ramps of the unconstrained plan
+    targets = [0, 1, 2, 3, 2, 1, 0, 1, 2, 3, 4, 5]
+    inst = make_instance(
+        targets=targets, min_delay=0, max_delay=10, max_step=2,
+        max_ramps=6, anchors=[(0, 0), (11, 5)],
+        min_ramp_steps=3)
+    res = compile_plan(inst)
+    assert res["feasible"] is True
+    check_feasible_shape(inst, res)
+    assert all(r["stepCount"] >= 3 for r in res["ramps"])
+
+
+# ---------------------------------------------------------------------------
 # exhaustive cross-check against brute force
 # ---------------------------------------------------------------------------
 
@@ -337,6 +476,54 @@ def test_matches_brute_force(seed):
     if best is None:
         assert res["feasible"] is False
         assert res["delays"] is None
+    else:
+        assert res["feasible"] is True
+        check_feasible_shape(inst, res)
+        assert result_key(res) == best
+
+
+def _anchor_pair_conflict(inst: Instance) -> bool:
+    ordered = sorted(inst.anchors, key=lambda a: a.element)
+    for x in range(len(ordered)):
+        for y in range(x + 1, len(ordered)):
+            a, b = ordered[x], ordered[y]
+            if abs(b.delay - a.delay) > inst.max_step * (b.element - a.element):
+                return True
+    return False
+
+
+def random_hold_instance(rng: random.Random) -> Instance:
+    n = 12
+    lo = rng.randint(0, 2)
+    hi = lo + rng.randint(2, 4)
+    max_step = rng.randint(1, 2)
+    max_ramps = rng.randint(1, 4)
+    min_ramp_steps = rng.choice([2, 3, 4])
+    targets = [rng.randint(lo - 1, hi + 1) for _ in range(n)]
+    elements = rng.sample(range(n), rng.randint(2, 3))
+    anchors = [(e, rng.randint(lo, hi)) for e in sorted(elements)]
+    return make_instance(targets, lo, hi, max_step, max_ramps, anchors,
+                         min_ramp_steps=min_ramp_steps)
+
+
+@pytest.mark.parametrize("seed", range(50))
+def test_matches_brute_force_with_hold(seed):
+    rng = random.Random(20_000 + seed)
+    inst = random_hold_instance(rng)
+    res = compile_plan(inst)
+    best = brute_force_best(inst)
+    if best is None:
+        assert res["feasible"] is False
+        assert res["delays"] is None
+        assert res["errors"] is None
+        assert res["ramps"] is None
+        if _anchor_pair_conflict(inst):
+            assert res["reason"] == "anchor-step-conflict"
+        else:
+            # every joint-constraint dead end (ramp cap, anchors, span
+            # together) reports the stable span conflict
+            assert res["reason"] == "ramp-span-conflict"
+            assert res["minRampSteps"] == inst.min_ramp_steps
     else:
         assert res["feasible"] is True
         check_feasible_shape(inst, res)

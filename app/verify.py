@@ -145,6 +145,7 @@ def _check_plan_invariants(body: dict, request: dict) -> list[str]:
     if len(body["ramps"]) != runs:
         problems.append("ramps list length mismatch")
     pos = 0
+    hold = request.get("minRampSteps")
     for ramp in body["ramps"]:
         if ramp["startElement"] != pos:
             problems.append("ramp boundaries are not contiguous")
@@ -154,6 +155,14 @@ def _check_plan_invariants(body: dict, request: dict) -> list[str]:
         span = ramp["endElement"] - ramp["startElement"]
         if span < 1 or delays[ramp["endElement"]] - delays[ramp["startElement"]] != ramp["slope"] * span:
             problems.append("ramp slope inconsistent with boundary values")
+        if hold is not None:
+            if ramp.get("stepCount") != span:
+                problems.append("ramp stepCount missing or inconsistent")
+            if span < hold:
+                problems.append(
+                    f"ramp span {span} shorter than minRampSteps {hold}")
+        elif "stepCount" in ramp:
+            problems.append("stepCount must be absent without minRampSteps")
         pos = ramp["endElement"]
     if pos != n - 1:
         problems.append("ramps do not cover all elements")
@@ -214,6 +223,24 @@ def run_api_smoke() -> bool:
             {"element": 11, "delay": 7},
         ],
     }
+    # minimum ramp hold enabled: both legs of the triangle span 11 steps,
+    # so the request is feasible and every ramp carries stepCount
+    hold_feasible_req = dict(feasible_req, minRampSteps=3)
+    # minimum ramp hold infeasible: the forced 2 -> 0 drop over the final
+    # three elements leaves a two-step last ramp, shorter than hold 3
+    hold_conflict_req = {
+        "targets": [2] * 12,
+        "minDelay": 0,
+        "maxDelay": 40,
+        "maxStep": 1,
+        "maxRamps": 6,
+        "minRampSteps": 3,
+        "anchors": [
+            {"element": 0, "delay": 2},
+            {"element": 8, "delay": 2},
+            {"element": 11, "delay": 0},
+        ],
+    }
 
     ok = True
     try:
@@ -254,6 +281,37 @@ def run_api_smoke() -> bool:
                 and body.get("minRampsRequired") == 3)
         print(f"[verify]   {'ok  ' if good else 'FAIL'} ramp-limit request -> "
               f"{status} reason={body.get('reason')!r}", flush=True)
+        ok = ok and good
+
+        # minimum ramp hold: feasible triangle, stepCount on every ramp
+        status, body = _http("POST", "/api/delay-plans/compile",
+                             hold_feasible_req)
+        good = (status == 200 and body.get("feasible") is True
+                and all(r.get("stepCount")
+                        == r["endElement"] - r["startElement"] >= 3
+                        for r in body.get("ramps", [])))
+        if good:
+            problems = _check_plan_invariants(body, hold_feasible_req)
+            good = not problems
+            for p in problems:
+                print(f"[verify]   FAIL hold-feasible plan: {p}", flush=True)
+        print(f"[verify]   {'ok  ' if good else 'FAIL'} hold-feasible "
+              f"request (minRampSteps=3) -> {status} "
+              f"ramps={body.get('rampCount') if body else None}", flush=True)
+        ok = ok and good
+
+        # minimum ramp hold: infeasible joint conflict, fully partial-free
+        status, body = _http("POST", "/api/delay-plans/compile",
+                             hold_conflict_req)
+        good = (status == 200 and body.get("feasible") is False
+                and body.get("reason") == "ramp-span-conflict"
+                and body.get("minRampSteps") == 3
+                and body.get("delays") is None
+                and body.get("errors") is None
+                and body.get("ramps") is None)
+        print(f"[verify]   {'ok  ' if good else 'FAIL'} hold-conflict "
+              f"request -> {status} reason={body.get('reason')!r}",
+              flush=True)
         ok = ok and good
     except (urllib.error.URLError, ConnectionError, OSError, json.JSONDecodeError) as exc:
         print(f"[verify]   FAIL smoke request raised {exc!r}", flush=True)

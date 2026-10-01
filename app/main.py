@@ -13,9 +13,14 @@ app = FastAPI(
     description=(
         "Compiles per-element target delays into an integer delay sequence "
         "with a bounded number of ramps, honouring a global delay interval, "
-        "a max adjacent-step limit and exact element anchors. Feasible plans "
-        "minimise, in order: max absolute error, total absolute error, "
-        "actual ramp count, and the lexicographic delay sequence."
+        "a max adjacent-step limit and exact element anchors. An optional "
+        "minRampSteps (2..8) further requires every constant-slope ramp, "
+        "including the first and last, to span at least that many adjacent "
+        "steps; it is arbitrated jointly with the other constraints. "
+        "Feasible plans minimise, in order: max absolute error, total "
+        "absolute error, actual ramp count, and the lexicographic delay "
+        "sequence. When the joint constraints are unsatisfiable with the "
+        "hold enabled the stable reason is ramp-span-conflict."
     ),
 )
 
