@@ -14,6 +14,8 @@ MAX_ANCHORS = 8
 # +/-VALUE_LIMIT so the integer DP costs cannot overflow int32.
 VALUE_LIMIT = 100_000
 MAX_RAMPS_LIMIT = 47  # n - 1 for the largest supported plan
+MIN_RAMP_STEPS_MIN = 2   # a hold below 2 steps constrains nothing new
+MIN_RAMP_STEPS_MAX = 8   # firmware shift-register depth
 
 
 class AnchorIn(BaseModel):
@@ -36,6 +38,11 @@ class CompileRequest(BaseModel):
                          description="max allowed absolute change between adjacent elements")
     maxRamps: int = Field(ge=1, le=MAX_RAMPS_LIMIT,
                           description="max number of ramps (runs of equal adjacent differences)")
+    minRampSteps: int | None = Field(
+        default=None, ge=MIN_RAMP_STEPS_MIN, le=MIN_RAMP_STEPS_MAX,
+        description="optional minimum number of adjacent steps every ramp "
+                    "must hold its slope for before the next change; "
+                    "applies to the first and last ramp as well")
     anchors: list[AnchorIn] = Field(
         min_length=MIN_ANCHORS, max_length=MAX_ANCHORS,
         description="elements whose delays must be hit exactly")
@@ -68,4 +75,5 @@ class CompileRequest(BaseModel):
             max_ramps=self.maxRamps,
             anchors=tuple(Anchor(element=a.element, delay=a.delay)
                           for a in self.anchors),
+            min_ramp_steps=self.minRampSteps,
         )

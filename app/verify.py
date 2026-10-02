@@ -8,7 +8,11 @@ Aggregates, and reports through the process exit code:
                            (application package, version metadata,
                            dependencies, generated OpenAPI schema);
 3. **API smoke**        -- typical compile requests executed over HTTP
-                           against the live ``api`` service.
+                           against the live ``api`` service, covering
+                           legacy requests (which must keep their exact
+                           legacy response shape) and requests with the
+                           optional minimum ramp-hold constraint, both
+                           feasible and jointly infeasible.
 
 Exit code 0 means every group passed; 1 means at least one group failed.
 """
@@ -145,6 +149,7 @@ def _check_plan_invariants(body: dict, request: dict) -> list[str]:
     if len(body["ramps"]) != runs:
         problems.append("ramps list length mismatch")
     pos = 0
+    hold = request.get("minRampSteps")
     for ramp in body["ramps"]:
         if ramp["startElement"] != pos:
             problems.append("ramp boundaries are not contiguous")
@@ -154,6 +159,15 @@ def _check_plan_invariants(body: dict, request: dict) -> list[str]:
         span = ramp["endElement"] - ramp["startElement"]
         if span < 1 or delays[ramp["endElement"]] - delays[ramp["startElement"]] != ramp["slope"] * span:
             problems.append("ramp slope inconsistent with boundary values")
+        if hold is None:
+            # legacy requests must keep the legacy response shape
+            if "stepCount" in ramp:
+                problems.append("stepCount present without minRampSteps")
+        else:
+            if ramp.get("stepCount") != span:
+                problems.append("stepCount inconsistent with ramp boundaries")
+            elif span < hold:
+                problems.append("ramp shorter than minRampSteps")
         pos = ramp["endElement"]
     if pos != n - 1:
         problems.append("ramps do not cover all elements")
@@ -214,6 +228,24 @@ def run_api_smoke() -> bool:
             {"element": 11, "delay": 7},
         ],
     }
+    # minimum-hold feasible request: the legacy optimum already holds both
+    # slopes for >= 8 steps, so the plan is unchanged plus stepCount
+    hold_feasible_req = dict(feasible_req, minRampSteps=8)
+    # minimum-hold infeasible request: climbing 0 -> 2 over 11 steps with
+    # |slope| <= 1 needs a 2-step ramp, so a 3-step hold with maxRamps=2
+    # has no joint solution
+    hold_conflict_req = {
+        "targets": [1] * 12,
+        "minDelay": 0,
+        "maxDelay": 3,
+        "maxStep": 1,
+        "maxRamps": 2,
+        "minRampSteps": 3,
+        "anchors": [
+            {"element": 0, "delay": 0},
+            {"element": 11, "delay": 2},
+        ],
+    }
 
     ok = True
     try:
@@ -254,6 +286,49 @@ def run_api_smoke() -> bool:
                 and body.get("minRampsRequired") == 3)
         print(f"[verify]   {'ok  ' if good else 'FAIL'} ramp-limit request -> "
               f"{status} reason={body.get('reason')!r}", flush=True)
+        ok = ok and good
+
+        # minimum-hold constraint: feasible case keeps the legacy optimum
+        # and reports a consistent stepCount per ramp
+        status, body = _http("POST", "/api/delay-plans/compile",
+                             hold_feasible_req)
+        if status != 200 or not body.get("feasible"):
+            print(f"[verify]   FAIL min-hold feasible request -> {status} "
+                  f"{body}", flush=True)
+            ok = False
+        else:
+            problems = _check_plan_invariants(body, hold_feasible_req)
+            step_counts = [r.get("stepCount") for r in body["ramps"]]
+            if step_counts != [11, 12]:
+                problems.append(f"unexpected stepCounts {step_counts}")
+            if problems:
+                for p in problems:
+                    print(f"[verify]   FAIL min-hold feasible plan: {p}",
+                          flush=True)
+                ok = False
+            else:
+                print(f"[verify]   ok   min-hold feasible plan "
+                      f"(stepCounts={step_counts})", flush=True)
+
+        # minimum-hold constraint: jointly infeasible case returns a stable
+        # ramp-span-conflict with no partial delay table
+        status, body = _http("POST", "/api/delay-plans/compile",
+                             hold_conflict_req)
+        good = (status == 200 and body.get("feasible") is False
+                and body.get("reason") == "ramp-span-conflict"
+                and body.get("delays") is None
+                and body.get("errors") is None
+                and body.get("ramps") is None
+                and body.get("maxAbsError") is None
+                and body.get("totalAbsError") is None
+                and body.get("rampCount") is None
+                and body.get("minRampSteps") == 3)
+        if good:
+            status2, body2 = _http("POST", "/api/delay-plans/compile",
+                                   hold_conflict_req)
+            good = status2 == 200 and body2 == body
+        print(f"[verify]   {'ok  ' if good else 'FAIL'} min-hold conflict "
+              f"request -> {status} reason={body.get('reason')!r}", flush=True)
         ok = ok and good
     except (urllib.error.URLError, ConnectionError, OSError, json.JSONDecodeError) as exc:
         print(f"[verify]   FAIL smoke request raised {exc!r}", flush=True)

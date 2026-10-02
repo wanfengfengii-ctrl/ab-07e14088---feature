@@ -9,13 +9,16 @@ from .solver import SolverResourceError, compile_plan
 
 app = FastAPI(
     title="Ultrasound Delay Plan Compiler",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Compiles per-element target delays into an integer delay sequence "
         "with a bounded number of ramps, honouring a global delay interval, "
-        "a max adjacent-step limit and exact element anchors. Feasible plans "
-        "minimise, in order: max absolute error, total absolute error, "
-        "actual ramp count, and the lexicographic delay sequence."
+        "a max adjacent-step limit and exact element anchors. An optional "
+        "minRampSteps (2..8) additionally forces every ramp — including the "
+        "first and last — to hold its slope for at least that many adjacent "
+        "steps before the next shift. Feasible plans minimise, in order: "
+        "max absolute error, total absolute error, actual ramp count, and "
+        "the lexicographic delay sequence."
     ),
 )
 
@@ -31,9 +34,11 @@ def compile_delay_plan(request: CompileRequest) -> dict:
 
     Returns HTTP 200 with ``feasible: true`` and the optimal plan, or
     HTTP 200 with ``feasible: false`` plus a stable infeasibility reason
-    (including the conflicting element interval for anchor/step clashes)
-    and no partial delay table.  Malformed or out-of-envelope requests
-    are rejected with HTTP 422.
+    (including the conflicting element interval for anchor/step clashes,
+    or ``ramp-span-conflict`` when the requested minimum ramp hold cannot
+    be met jointly with the other constraints) and no partial delay
+    table.  Malformed or out-of-envelope requests are rejected with
+    HTTP 422.
     """
     try:
         return compile_plan(request.to_instance())

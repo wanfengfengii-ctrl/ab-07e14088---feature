@@ -5,9 +5,12 @@ feasible when it
 
 * stays inside the global ``[min_delay, max_delay]`` interval,
 * hits every anchor exactly,
-* keeps ``|x[i+1] - x[i]| <= max_step`` for adjacent elements, and
+* keeps ``|x[i+1] - x[i]| <= max_step`` for adjacent elements,
 * uses at most ``max_ramps`` *ramps*, where a ramp is a maximal run of
-  equal adjacent differences (i.e. one constant-slope segment).
+  equal adjacent differences (i.e. one constant-slope segment), and
+* when ``min_ramp_steps`` is set, holds every ramp for at least that many
+  adjacent steps before the next slope change — the first and the last
+  ramp of the plan are held to the same minimum.
 
 Feasible plans are ranked lexicographically by
 
@@ -17,7 +20,13 @@ Feasible plans are ranked lexicographically by
 4. lexicographic order of the delay sequence itself.
 
 All decisions use integer arithmetic only.  The solver is a dynamic
-program over ``(position, value, incoming slope, ramps used)``:
+program over ``(position, value, incoming slope, ramps used, current ramp
+run length)`` where the run length is capped at the required hold (a
+slope change is only legal from a state whose run length has reached the
+hold, and a plan is only complete when its final ramp has reached it).
+The hold is therefore adjudicated jointly with the anchors, the step
+limit and the ramp cap inside one DP — never by post-processing an
+optimal hold-free sequence:
 
 * pass 1 (forward, bottleneck cost) finds the minimal max-abs-error ``E*``;
 * pass 2 (backward suffix DP, full layers) minimises the combined cost
@@ -26,6 +35,9 @@ program over ``(position, value, incoming slope, ramps used)``:
   this is exactly the lexicographic pair ``(total_error, ramps)``;
 * pass 3 greedily rebuilds the lexicographically smallest optimal
   sequence using the suffix layers.
+
+Requests without ``min_ramp_steps`` run the identical algorithm with a
+hold of one step, which is exactly the legacy constraint set.
 """
 
 from __future__ import annotations
@@ -64,6 +76,9 @@ class Instance:
     max_step: int
     max_ramps: int
     anchors: tuple
+    # optional minimum number of adjacent steps every ramp must hold its
+    # slope for before the next change (None disables the constraint)
+    min_ramp_steps: int | None = None
 
     @property
     def n(self) -> int:
@@ -137,8 +152,8 @@ def _error_arrays(domains, targets) -> list[np.ndarray]:
     return out
 
 
-def _layer_cells(domains, slopes, ramp_cap) -> tuple[int, int]:
-    """(total, peak) DP cells for the given domains and ramp cap."""
+def _layer_cells(domains, slopes, ramp_cap, hold) -> tuple[int, int]:
+    """(total, peak) DP cells for the given domains, ramp cap and hold."""
     total = 0
     peak = 0
     for i, (lo, hi) in enumerate(domains):
@@ -147,14 +162,14 @@ def _layer_cells(domains, slopes, ramp_cap) -> tuple[int, int]:
             kw = 1
         else:
             kw = max(1, slopes[i][1] - slopes[i][0] + 1)
-        cells = ramp_cap * w * kw
+        cells = ramp_cap * w * kw * hold
         total += cells
         peak = max(peak, cells)
     return total, peak
 
 
-def _guard_budget(domains, slopes, ramp_cap) -> None:
-    total, peak = _layer_cells(domains, slopes, ramp_cap)
+def _guard_budget(domains, slopes, ramp_cap, hold) -> None:
+    total, peak = _layer_cells(domains, slopes, ramp_cap, hold)
     if total > MAX_STATE_CELLS or peak > MAX_STATE_CELLS:
         raise SolverResourceError(
             f"instance requires about {total} DP states, "
@@ -164,6 +179,12 @@ def _guard_budget(domains, slopes, ramp_cap) -> None:
 
 # ---------------------------------------------------------------------------
 # forward DP (bottleneck for pass 1, summed cost for the min-ramps probe)
+#
+# Layers are indexed [ramps_used, value, incoming_slope, run_length] where
+# run_length is the number of adjacent steps the current ramp has held its
+# slope for, capped at ``hold`` (index hold-1 therefore means "the hold is
+# satisfied").  A slope change is only legal out of the capped run length
+# and restarts the run length at one.
 # ---------------------------------------------------------------------------
 
 def _forward_step(g_prev, lo_prev, k_lo_prev, lo_cur, k_lo_cur, k_hi_cur,
@@ -171,28 +192,36 @@ def _forward_step(g_prev, lo_prev, k_lo_prev, lo_cur, k_lo_cur, k_hi_cur,
     ramp_cap = g_prev.shape[0]
     w_prev = g_prev.shape[1]
     kw_prev = g_prev.shape[2]
+    hold = g_prev.shape[3]
     k_hi_prev = k_lo_prev + kw_prev - 1
     w_cur = err_cur.shape[0]
     kw_cur = k_hi_cur - k_lo_cur + 1
     values_cur = lo_cur + np.arange(w_cur)
 
-    # continue the current ramp with the same slope
-    same = np.full((ramp_cap, w_cur, kw_cur), INF, dtype=np.int32)
+    # continue the current ramp with the same slope: the run length grows
+    # by one, capped at the required hold
+    same = np.full((ramp_cap, w_cur, kw_cur, hold), INF, dtype=np.int32)
     ks_lo = max(k_lo_cur, k_lo_prev)
     ks_hi = min(k_hi_cur, k_hi_prev)
     for k in range(ks_lo, ks_hi + 1):
         src = values_cur - (k + lo_prev)
         valid = (src >= 0) & (src < w_prev)
         if valid.any():
-            same[:, valid, k - k_lo_cur] = g_prev[:, src[valid], k - k_lo_prev]
+            block = g_prev[:, src[valid], k - k_lo_prev, :]
+            same[:, valid, k - k_lo_cur, 1:] = block[:, :, :-1]
+            same[:, valid, k - k_lo_cur, -1] = np.minimum(
+                same[:, valid, k - k_lo_cur, -1], block[:, :, -1])
 
-    # open a new ramp with a different slope:
-    # change[r', v', k'] = min over k_prev != k' of g_prev[r'-1, v'-k', k_prev]
+    # open a new ramp with a different slope: only states whose current
+    # ramp has been held for the required number of steps may shift, and
+    # the new ramp starts with a run length of one step:
+    # change[r', v', k', 0] = min over k_prev != k' of
+    #                         g_prev[r'-1, v'-k', k_prev, hold-1]
     # The predecessor value v'-k' is fixed per target slope k', so first
     # precompute the two smallest values along the previous slope axis.
-    change = np.full((ramp_cap, w_cur, kw_cur), INF, dtype=np.int32)
+    change = np.full((ramp_cap, w_cur, kw_cur, hold), INF, dtype=np.int32)
     if ramp_cap > 1:
-        head = g_prev[: ramp_cap - 1]                # (R-1, w_prev, kw_prev)
+        head = g_prev[: ramp_cap - 1, :, :, hold - 1]  # (R-1, w_prev, kw_prev)
         arg1 = head.argmin(axis=2)
         if kw_prev > 1:
             part = np.partition(head, 1, axis=2)
@@ -214,17 +243,17 @@ def _forward_step(g_prev, lo_prev, k_lo_prev, lo_cur, k_lo_cur, k_hi_cur,
                 picked = min1[:, src[valid]]
             if mode == "sum":
                 picked = picked + 1  # a slope change opens one more ramp
-            change[1:, valid, k - k_lo_cur] = picked
+            change[1:, valid, k - k_lo_cur, 0] = picked
 
     best = np.minimum(same, change)
     if mode == "bottleneck":
-        return np.maximum(best, err_cur[None, :, None])
+        return np.maximum(best, err_cur[None, :, None, None])
     err = (err_cur.astype(np.int64) * multiplier).astype(np.int32)
-    return best + err[None, :, None]
+    return best + err[None, :, None, None]
 
 
-def _forward_dp(domains, targets, max_step, ramp_cap, mode, multiplier=1,
-                error_weight=1):
+def _forward_dp(domains, targets, max_step, ramp_cap, hold, mode,
+                multiplier=1, error_weight=1):
     """Rolling forward DP; returns the layer at the last position."""
     n = len(domains)
     slopes = _slope_ranges(domains, max_step)
@@ -236,7 +265,7 @@ def _forward_dp(domains, targets, max_step, ramp_cap, mode, multiplier=1,
     lo1, hi1 = domains[1]
     k_lo1, k_hi1 = slopes[1]
     w1 = hi1 - lo1 + 1
-    g = np.full((ramp_cap, w1, k_hi1 - k_lo1 + 1), INF, dtype=np.int32)
+    g = np.full((ramp_cap, w1, k_hi1 - k_lo1 + 1, hold), INF, dtype=np.int32)
     values1 = lo1 + np.arange(w1)
     e0_all = errs[0].astype(np.int64)
     e1_all = errs[1].astype(np.int64)
@@ -251,7 +280,7 @@ def _forward_dp(domains, targets, max_step, ramp_cap, mode, multiplier=1,
             cost = np.maximum(e0, e1)
         else:
             cost = (e0 + e1) * multiplier + 1
-        g[0, valid, k - k_lo1] = cost.astype(np.int32)
+        g[0, valid, k - k_lo1, 0] = cost.astype(np.int32)
 
     for i in range(2, n):
         g = _forward_step(g, domains[i - 1][0], slopes[i - 1][0],
@@ -269,30 +298,36 @@ def _suffix_step(s_next, lo_next, k_lo_next, lo_cur, k_lo_cur, k_hi_cur,
     ramp_cap = s_next.shape[0]
     w_next = s_next.shape[1]
     kw_next = s_next.shape[2]
+    hold = s_next.shape[3]
     k_hi_next = k_lo_next + kw_next - 1
     w_cur = err_cur.shape[0]
     kw_cur = k_hi_cur - k_lo_cur + 1
     values_cur = lo_cur + np.arange(w_cur)
 
-    # continue the current ramp with the same slope
-    same = np.full((ramp_cap, w_cur, kw_cur), INF, dtype=np.int32)
+    # continue the current ramp with the same slope: the run length at the
+    # next position is one longer than at the current one (capped)
+    same = np.full((ramp_cap, w_cur, kw_cur, hold), INF, dtype=np.int32)
     ks_lo = max(k_lo_cur, k_lo_next)
     ks_hi = min(k_hi_cur, k_hi_next)
     for k in range(ks_lo, ks_hi + 1):
         dst = values_cur + k - lo_next
         valid = (dst >= 0) & (dst < w_next)
         if valid.any():
-            same[:, valid, k - k_lo_cur] = s_next[:, dst[valid], k - k_lo_next]
+            block = s_next[:, dst[valid], k - k_lo_next, :]
+            same[:, valid, k - k_lo_cur, :-1] = block[:, :, 1:]
+            same[:, valid, k - k_lo_cur, -1] = block[:, :, -1]
 
-    # open a new ramp with a different slope (costs one extra ramp)
-    change = np.full((ramp_cap, w_cur, kw_cur), INF, dtype=np.int32)
+    # open a new ramp with a different slope (costs one extra ramp); only
+    # a current ramp that already satisfies the hold may be left, and the
+    # next ramp starts with a run length of one step
+    change = np.full((ramp_cap, w_cur, kw_cur, hold), INF, dtype=np.int32)
     if ramp_cap > 1:
         stacked = np.full((ramp_cap - 1, w_cur, kw_next), INF, dtype=np.int32)
         for kk in range(kw_next):
             dst = values_cur + (k_lo_next + kk) - lo_next
             valid = (dst >= 0) & (dst < w_next)
             if valid.any():
-                stacked[:, valid, kk] = s_next[1:][:, dst[valid], kk]
+                stacked[:, valid, kk] = s_next[1:][:, dst[valid], kk, 0]
         best1 = stacked.min(axis=2)
         arg1 = stacked.argmin(axis=2)
         jj, vv = np.indices(best1.shape)
@@ -301,15 +336,15 @@ def _suffix_step(s_next, lo_next, k_lo_next, lo_cur, k_lo_cur, k_hi_cur,
         kk_idx = np.arange(k_lo_cur, k_hi_cur + 1) - k_lo_next
         in_next = (kk_idx >= 0) & (kk_idx < kw_next)
         is_arg = in_next[None, None, :] & (kk_idx[None, None, :] == arg1[:, :, None])
-        change[: ramp_cap - 1] = np.where(is_arg, best2[:, :, None],
-                                          best1[:, :, None]) + 1
+        change[: ramp_cap - 1, :, :, hold - 1] = np.where(
+            is_arg, best2[:, :, None], best1[:, :, None]) + 1
 
     out = np.minimum(same, change)
     err = (err_cur.astype(np.int64) * multiplier).astype(np.int32)
-    return out + err[None, :, None]
+    return out + err[None, :, None, None]
 
 
-def _suffix_dp(domains, targets, max_step, ramp_cap, multiplier):
+def _suffix_dp(domains, targets, max_step, ramp_cap, hold, multiplier):
     n = len(domains)
     slopes = _slope_ranges(domains, max_step)
     errs = _error_arrays(domains, targets)
@@ -317,8 +352,11 @@ def _suffix_dp(domains, targets, max_step, ramp_cap, multiplier):
 
     lo, hi = domains[-1]
     k_lo, k_hi = slopes[-1]
-    base = np.empty((ramp_cap, hi - lo + 1, k_hi - k_lo + 1), dtype=np.int32)
-    base[:] = (errs[-1].astype(np.int64) * multiplier).astype(np.int32)[:, None]
+    # a plan is only complete when its last ramp also satisfies the hold
+    base = np.full((ramp_cap, hi - lo + 1, k_hi - k_lo + 1, hold), INF,
+                   dtype=np.int32)
+    base[:, :, :, hold - 1] = (
+        errs[-1].astype(np.int64) * multiplier).astype(np.int32)[:, None]
     layers[-1] = base
 
     for i in range(n - 2, 0, -1):
@@ -347,13 +385,14 @@ def _first_position_costs(layers, slopes, errs, domains, multiplier):
         dst = values0 + k - lo1
         valid = (dst >= 0) & (dst < w1)
         if valid.any():
-            # the first difference always opens the first ramp (+1)
-            cand = e0[valid] + 1 + s1[0, dst[valid], k - k_lo1].astype(np.int64)
+            # the first difference always opens the first ramp (+1) with a
+            # run length of one step (run-length index 0)
+            cand = e0[valid] + 1 + s1[0, dst[valid], k - k_lo1, 0].astype(np.int64)
             best[valid] = np.minimum(best[valid], cand)
     return best
 
 
-def _greedy_sequence(layers, slopes, errs, domains, multiplier):
+def _greedy_sequence(layers, slopes, errs, domains, multiplier, hold):
     """Rebuild the lexicographically smallest optimal delay sequence."""
     n = len(domains)
     ramp_cap = layers[1].shape[0]
@@ -373,7 +412,7 @@ def _greedy_sequence(layers, slopes, errs, domains, multiplier):
         k = v1 - x0
         if k < k_lo1 or k > k_hi1:
             continue
-        if int(s1[0, v1 - lo1, k - k_lo1]) == residual:
+        if int(s1[0, v1 - lo1, k - k_lo1, 0]) == residual:
             chosen = (v1, k)
             break
     if chosen is None:
@@ -381,12 +420,14 @@ def _greedy_sequence(layers, slopes, errs, domains, multiplier):
     seq.append(chosen[0])
     k_cur = chosen[1]
     r_cur = 0  # ramp index 0 == one ramp used so far
+    run = 1    # the first ramp currently holds its slope for one step
 
     for i in range(2, n):
         lo_prev, _ = domains[i - 1]
         k_lo_prev, _ = slopes[i - 1]
         s_prev = layers[i - 1]
-        residual = (int(s_prev[r_cur, seq[-1] - lo_prev, k_cur - k_lo_prev])
+        residual = (int(s_prev[r_cur, seq[-1] - lo_prev, k_cur - k_lo_prev,
+                               run - 1])
                     - int(errs[i - 1][seq[-1] - lo_prev]) * multiplier)
         lo_i, hi_i = domains[i]
         k_lo_i, k_hi_i = slopes[i]
@@ -396,20 +437,25 @@ def _greedy_sequence(layers, slopes, errs, domains, multiplier):
             k = v - seq[-1]
             if k < k_lo_i or k > k_hi_i:
                 continue
-            opens_new_ramp = k != k_cur
-            r_new = r_cur + 1 if opens_new_ramp else r_cur
+            if k == k_cur:
+                r_new, run_new, extra = r_cur, min(run + 1, hold), 0
+            else:
+                if run < hold:
+                    continue  # the current ramp has not met its hold yet
+                r_new, run_new, extra = r_cur + 1, 1, 1
             if r_new >= ramp_cap:
                 continue
             # a slope change is charged one extra ramp at this transition
-            cand = int(s_i[r_new, v - lo_i, k - k_lo_i]) + (1 if opens_new_ramp else 0)
+            cand = int(s_i[r_new, v - lo_i, k - k_lo_i, run_new - 1]) + extra
             if cand == residual:
-                chosen = (v, k, r_new)
+                chosen = (v, k, r_new, run_new)
                 break
         if chosen is None:
             raise RuntimeError(f"greedy reconstruction failed at element {i}")
         seq.append(chosen[0])
         k_cur = chosen[1]
         r_cur = chosen[2]
+        run = chosen[3]
     return seq, c_star
 
 
@@ -454,16 +500,16 @@ def _min_ramps(inst: Instance, domains, slopes) -> int | None:
     """Smallest ramp count of any constraint-satisfying sequence."""
     ramp_cap = inst.n - 1
     try:
-        _guard_budget(domains, slopes, ramp_cap)
+        _guard_budget(domains, slopes, ramp_cap, 1)
     except SolverResourceError:
         return None
-    g = _forward_dp(domains, inst.targets, inst.max_step, ramp_cap,
+    g = _forward_dp(domains, inst.targets, inst.max_step, ramp_cap, 1,
                     mode="sum", multiplier=1, error_weight=0)
-    best = int(g.min())
+    best = int(g[:, :, :, 0].min())
     return best if best < INF else None
 
 
-def _assert_solution(inst: Instance, seq, ramp_cap) -> None:
+def _assert_solution(inst: Instance, seq, ramp_cap, hold) -> None:
     anchor_map = {a.element: a.delay for a in inst.anchors}
     assert len(seq) == inst.n
     for i, v in enumerate(seq):
@@ -472,7 +518,12 @@ def _assert_solution(inst: Instance, seq, ramp_cap) -> None:
             assert v == anchor_map[i]
         if i:
             assert abs(v - seq[i - 1]) <= inst.max_step
-    assert len(_ramps_of(seq)) <= ramp_cap
+    ramps = _ramps_of(seq)
+    assert len(ramps) <= ramp_cap
+    # every slope must be held for the required number of steps before the
+    # next shift — including the first and the last ramp
+    for s, e, _k in ramps:
+        assert e - s >= hold
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +534,7 @@ def compile_plan(inst: Instance) -> dict:
     """Compile one delay plan; returns the API response payload."""
     n = inst.n
     ramp_cap = min(inst.max_ramps, n - 1)
+    hold = inst.min_ramp_steps if inst.min_ramp_steps is not None else 1
 
     # anchors must sit inside the global delay interval
     for a in inst.anchors:
@@ -520,16 +572,26 @@ def compile_plan(inst: Instance) -> dict:
             }
         })
 
-    # pass 1: minimal achievable max-abs-error under the ramp cap
+    # pass 1: minimal achievable max-abs-error under the ramp cap and the
+    # minimum ramp-hold constraint (jointly, inside one DP)
     domains1 = _position_domains(inst, None)
     slopes1 = _slope_ranges(domains1, inst.max_step)
     if not _domains_valid(domains1, slopes1):
         return _infeasible("constraints-unsatisfiable", {})
-    _guard_budget(domains1, slopes1, ramp_cap)
-    g1 = _forward_dp(domains1, inst.targets, inst.max_step, ramp_cap,
+    _guard_budget(domains1, slopes1, ramp_cap, hold)
+    g1 = _forward_dp(domains1, inst.targets, inst.max_step, ramp_cap, hold,
                      mode="bottleneck")
-    e_star = int(g1.min())
+    # only states whose final ramp satisfies the hold complete a plan
+    e_star = int(g1[:, :, :, hold - 1].min())
     if e_star >= INF:
+        if inst.min_ramp_steps is not None:
+            # the hold, anchors, step limit and ramp cap cannot be met
+            # jointly: report one stable conflict and no partial plan
+            return _infeasible("ramp-span-conflict", {
+                "minRampSteps": inst.min_ramp_steps,
+                "maxRamps": inst.max_ramps,
+                "elements": n,
+            })
         min_ramps = _min_ramps(inst, domains1, slopes1)
         detail = {"maxRamps": inst.max_ramps}
         if min_ramps is not None:
@@ -541,20 +603,35 @@ def compile_plan(inst: Instance) -> dict:
     slopes2 = _slope_ranges(domains2, inst.max_step)
     if not _domains_valid(domains2, slopes2):
         raise RuntimeError("tightened domains unexpectedly infeasible")
-    _guard_budget(domains2, slopes2, ramp_cap)
+    _guard_budget(domains2, slopes2, ramp_cap, hold)
     multiplier = ramp_cap + 1
     layers, slopes2, errs = _suffix_dp(domains2, inst.targets, inst.max_step,
-                                       ramp_cap, multiplier)
-    seq, c_star = _greedy_sequence(layers, slopes2, errs, domains2, multiplier)
+                                       ramp_cap, hold, multiplier)
+    seq, c_star = _greedy_sequence(layers, slopes2, errs, domains2,
+                                   multiplier, hold)
 
     errors = [d - t for d, t in zip(seq, inst.targets)]
     abs_errors = [abs(e) for e in errors]
     ramps = _ramps_of(seq)
 
     # cheap internal consistency checks (n <= 48)
-    _assert_solution(inst, seq, ramp_cap)
+    _assert_solution(inst, seq, ramp_cap, hold)
     assert max(abs_errors) == e_star
     assert sum(abs_errors) * multiplier + len(ramps) == c_star
+
+    ramp_dicts = []
+    for s, e, k in ramps:
+        ramp = {
+            "startElement": s,
+            "endElement": e,
+            "slope": k,
+            "startValue": seq[s],
+            "endValue": seq[e],
+        }
+        if inst.min_ramp_steps is not None:
+            # number of adjacent steps the slope is held for on this ramp
+            ramp["stepCount"] = e - s
+        ramp_dicts.append(ramp)
 
     return {
         "feasible": True,
@@ -563,14 +640,5 @@ def compile_plan(inst: Instance) -> dict:
         "maxAbsError": max(abs_errors),
         "totalAbsError": sum(abs_errors),
         "rampCount": len(ramps),
-        "ramps": [
-            {
-                "startElement": s,
-                "endElement": e,
-                "slope": k,
-                "startValue": seq[s],
-                "endValue": seq[e],
-            }
-            for s, e, k in ramps
-        ],
+        "ramps": ramp_dicts,
     }
